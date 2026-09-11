@@ -1,0 +1,943 @@
+name: test
+on:
+  push:
+    branches: [main]
+jobs:
+  x:
+    runs-on: ubuntu-latest
+name: Compilar firmware MeowKit (BLE Radar)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar PlatformIO y esptool
+        run: pip install --upgrade platformio esptool
+
+      - name: Traer las 3 librerias que faltan en el repo oficial
+        run: |
+          set -e
+          rm -rf lib/mooncake lib/ESP32-BLE-Mouse lib/IRremoteESP8266
+          git clone --depth 1 --branch v2.2.1 https://github.com/Forairaaaaa/mooncake.git lib/mooncake
+          git clone --depth 1 https://github.com/T-vK/ESP32-BLE-Mouse.git   lib/ESP32-BLE-Mouse
+          git clone --depth 1 https://github.com/crankyoldgit/IRremoteESP8266.git lib/IRremoteESP8266
+          rm -rf lib/*/.git
+
+      - name: Escribir la app BLE Radar (sustituye el stub app_10)
+        run: |
+          set -e
+          mkdir -p src/app/app_10
+          cat > src/app/app_10/ble_radar.h << 'ZZ_MEOW_EOF'
+          /**
+           * @file  ble_radar.h
+           * @brief Motor del BLE Radar — escucha pasiva de Bluetooth LE y mantiene
+           *        una tabla de aparatos vistos, cada uno con su señal (RSSI),
+           *        fabricante y nombre. Base para el radar + buscador.
+           *
+           * Fase 1: escanear + identificar + medir señal (distancia aproximada).
+           * (El radar visual y la brújula se añaden en fases siguientes.)
+           *
+           * Adaptado del patrón de escaneo BLE de MeowGotchi (janud/MeowKitCustomFW),
+           * que a su vez usa la API GAP nativa de ESP-IDF.
+           */
+          #pragma once
+          #include <cstdint>
+          #include <cstring>
+
+          /* ── Configuración centralizada ──────────────────────────────────────
+           * TODO parámetro ajustable del radar vive aquí, en un único sitio.
+           * Nadie más define estos números "a mano": el resto del código los lee
+           * desde aquí. Cambiar el comportamiento = tocar solo este bloque.       */
+          namespace BleRadarCfg {
+              constexpr int      MAX_DEV        = 40;     /* aparatos recordados a la vez */
+              constexpr uint32_t DEV_TIMEOUT_MS = 15000;  /* sin emitir > esto → se olvida */
+              constexpr uint32_t SWEEP_MS       = 1000;   /* cada cuánto se caducan viejos */
+
+              /* Suavizado de señal (media exponencial): rssi = (viejo*OLD + nuevo*NEW)/DIV */
+              constexpr int SMOOTH_OLD = 7;
+              constexpr int SMOOTH_NEW = 3;
+              constexpr int SMOOTH_DIV = SMOOTH_OLD + SMOOTH_NEW;
+
+              /* Umbrales de distancia por señal (dBm). Un único sitio para calibrar. */
+              constexpr int RSSI_NEAR = -55;   /* >= esto  → "< 2 m"   */
+              constexpr int RSSI_MID  = -68;   /* >= esto  → "2-4 m"   */
+              constexpr int RSSI_FAR  = -80;   /* >= esto  → "5-10 m"  (menos → "> 10 m") */
+
+              /* Buscador con brújula (Fase 3) */
+              constexpr uint32_t SPIN_MS = 6000;  /* duración de la vuelta para fijar rumbo */
+          }
+
+          /* Compatibilidad: alias corto usado por las estructuras de abajo. */
+          static constexpr int BR_MAX_DEV = BleRadarCfg::MAX_DEV;
+
+          /* Un aparato detectado. */
+          struct BleRadarDev {
+              uint8_t  mac[6];     /* dirección Bluetooth */
+              int16_t  rssi;       /* señal suavizada (dBm, ~-40 cerca .. ~-95 lejos) */
+              uint16_t vendorId;   /* código de fabricante (0 = desconocido) */
+              char     name[20];   /* nombre si lo anuncia ("" si no) */
+              uint32_t lastSeen;   /* millis() de la última vez que emitió */
+              bool     used;
+          };
+
+          class BleRadarMonitor {
+          public:
+              void begin();          /* arranca el escaneo pasivo */
+              void loop();           /* llamar en cada vuelta: caduca aparatos viejos */
+              void pause();
+              void resume();
+              bool running() const { return _running; }
+
+              /* Copia una instantánea ordenada por señal (más fuerte primero).
+               * Devuelve cuántos aparatos activos hay. `out` debe tener BR_MAX_DEV. */
+              int snapshot(BleRadarDev* out);
+
+              /* Nombre legible del fabricante a partir de su código. */
+              static const char* vendorName(uint16_t id);
+              /* Etiqueta de distancia aproximada a partir del RSSI. */
+              static const char* distanceLabel(int16_t rssi);
+
+          private:
+              bool _running = false;
+              uint32_t _lastSweep = 0;
+          };
+          ZZ_MEOW_EOF
+          cat > src/app/app_10/ble_radar.cpp << 'ZZ_MEOW_EOF'
+          /**
+           * @file  ble_radar.cpp
+           * @brief Implementación del motor BLE Radar (ver ble_radar.h).
+           */
+          #include "ble_radar.h"
+          #include <Arduino.h>
+          #include <BLEDevice.h>
+          #include "esp_gap_ble_api.h"
+
+          namespace {
+
+          /* ── Tabla de aparatos compartida con el callback del stack BLE ──────
+           * El callback corre en el contexto del Bluetooth, así que protegemos
+           * la tabla con un "portMUX" (candado) para no pisarnos con la UI.      */
+          portMUX_TYPE      s_mux = portMUX_INITIALIZER_UNLOCKED;
+          BleRadarDev       s_dev[BR_MAX_DEV];
+          int               s_count = 0;
+
+          /* Escaneo PASIVO: solo escuchar, no pedir datos (más discreto y con menos
+           * consumo). Ventana = intervalo → escucha continua.                    */
+          esp_ble_scan_params_t s_scan_params = {
+              .scan_type          = BLE_SCAN_TYPE_PASSIVE,
+              .own_addr_type      = BLE_ADDR_TYPE_PUBLIC,
+              .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
+              .scan_interval      = 0x50,
+              .scan_window        = 0x50,
+              .scan_duplicate     = BLE_SCAN_DUPLICATE_DISABLE,   /* oír cada anuncio */
+          };
+
+          /* Busca un aparato por MAC en la tabla; -1 si no está. */
+          int findByMac(const uint8_t* mac) {
+              for (int i = 0; i < s_count; i++)
+                  if (s_dev[i].used && memcmp(s_dev[i].mac, mac, 6) == 0) return i;
+              return -1;
+          }
+
+          /* Inserta o actualiza un aparato en la tabla. */
+          void upsert(const uint8_t* mac, int rssi, uint16_t vendor, const char* name) {
+              const uint32_t now = millis();
+              int idx = findByMac(mac);
+
+              if (idx < 0) {
+                  /* Aparato nuevo: usa un hueco libre, o si está llena reemplaza
+                   * al más viejo. */
+                  if (s_count < BR_MAX_DEV) {
+                      idx = s_count++;
+                  } else {
+                      uint32_t oldest = 0xFFFFFFFF;
+                      idx = 0;
+                      for (int i = 0; i < s_count; i++)
+                          if (s_dev[i].lastSeen < oldest) { oldest = s_dev[i].lastSeen; idx = i; }
+                  }
+                  memset(&s_dev[idx], 0, sizeof(BleRadarDev));
+                  memcpy(s_dev[idx].mac, mac, 6);
+                  s_dev[idx].rssi = (int16_t)rssi;          /* primera medida directa */
+                  s_dev[idx].used = true;
+              } else {
+                  /* Ya lo conocíamos: suavizamos la señal (media exponencial) para
+                   * que no dé botes. Los pesos salen de la config centralizada. */
+                  s_dev[idx].rssi = (int16_t)((s_dev[idx].rssi * BleRadarCfg::SMOOTH_OLD
+                                               + rssi * BleRadarCfg::SMOOTH_NEW)
+                                              / BleRadarCfg::SMOOTH_DIV);
+              }
+
+              if (vendor) s_dev[idx].vendorId = vendor;
+              if (name && name[0] && s_dev[idx].name[0] == '\0') {
+                  strncpy(s_dev[idx].name, name, sizeof(s_dev[idx].name) - 1);
+              }
+              s_dev[idx].lastSeen = now;
+          }
+
+          /* Callback GAP: se dispara con cada anuncio BLE que llega por el aire. */
+          void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* p) {
+              switch (event) {
+                  case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
+                      esp_ble_gap_start_scanning(0);              /* 0 = hasta que se pare */
+                      break;
+
+                  case ESP_GAP_BLE_SCAN_RESULT_EVT: {
+                      if (p->scan_rst.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT) break;
+                      uint8_t* adv = p->scan_rst.ble_adv;
+                      int rssi     = p->scan_rst.rssi;
+
+                      /* Fabricante: primeros 2 bytes de los "manufacturer specific data". */
+                      uint16_t vendor = 0;
+                      uint8_t  mlen = 0;
+                      uint8_t* md = esp_ble_resolve_adv_data(
+                          adv, ESP_BLE_AD_MANUFACTURER_SPECIFIC_TYPE, &mlen);
+                      if (md && mlen >= 2) vendor = (uint16_t)md[0] | ((uint16_t)md[1] << 8);
+
+                      /* Nombre: completo (0x09) o corto (0x08) si lo anuncia. */
+                      char name[20] = {0};
+                      uint8_t nlen = 0;
+                      uint8_t* nd = esp_ble_resolve_adv_data(
+                          adv, ESP_BLE_AD_TYPE_NAME_CMPL, &nlen);
+                      if (!nd) nd = esp_ble_resolve_adv_data(adv, ESP_BLE_AD_TYPE_NAME_SHORT, &nlen);
+                      if (nd && nlen) {
+                          uint8_t n = nlen < (uint8_t)(sizeof(name) - 1) ? nlen : (uint8_t)(sizeof(name) - 1);
+                          memcpy(name, nd, n);
+                          name[n] = '\0';
+                      }
+
+                      portENTER_CRITICAL_ISR(&s_mux);
+                      upsert(p->scan_rst.bda, rssi, vendor, name);
+                      portEXIT_CRITICAL_ISR(&s_mux);
+                      break;
+                  }
+                  default: break;
+              }
+          }
+
+          } // namespace
+
+          /* ── API pública ───────────────────────────────────────────────────── */
+
+          void BleRadarMonitor::begin() {
+              portENTER_CRITICAL(&s_mux);
+              s_count = 0;
+              memset(s_dev, 0, sizeof(s_dev));
+              portEXIT_CRITICAL(&s_mux);
+
+              BLEDevice::deinit(false);
+              BLEDevice::init("");
+              esp_ble_gap_register_callback(&gap_cb);
+              esp_ble_gap_set_scan_params(&s_scan_params);   /* al terminar, arranca solo */
+              _running   = true;
+              _lastSweep = millis();
+          }
+
+          void BleRadarMonitor::loop() {
+              if (!_running) return;
+              /* Cada segundo, retira aparatos que llevan >15 s sin emitir
+               * (ya no están o se apagaron). */
+              const uint32_t now = millis();
+              if (now - _lastSweep < BleRadarCfg::SWEEP_MS) return;
+              _lastSweep = now;
+
+              portENTER_CRITICAL(&s_mux);
+              for (int i = 0; i < s_count; i++) {
+                  if (s_dev[i].used && now - s_dev[i].lastSeen > BleRadarCfg::DEV_TIMEOUT_MS)
+                      s_dev[i].used = false;
+              }
+              /* compacta la tabla (quita los huecos libres) */
+              int w = 0;
+              for (int i = 0; i < s_count; i++)
+                  if (s_dev[i].used) { if (w != i) s_dev[w] = s_dev[i]; w++; }
+              s_count = w;
+              portEXIT_CRITICAL(&s_mux);
+          }
+
+          void BleRadarMonitor::pause() {
+              if (!_running) return;
+              esp_ble_gap_stop_scanning();
+              _running = false;
+          }
+
+          void BleRadarMonitor::resume() {
+              if (_running) return;
+              esp_ble_gap_start_scanning(0);
+              _running = true;
+          }
+
+          int BleRadarMonitor::snapshot(BleRadarDev* out) {
+              portENTER_CRITICAL(&s_mux);
+              int n = s_count;
+              memcpy(out, s_dev, sizeof(BleRadarDev) * (n < BR_MAX_DEV ? n : BR_MAX_DEV));
+              portEXIT_CRITICAL(&s_mux);
+
+              /* Orden simple (burbuja) por señal: más fuerte (mayor RSSI) primero.
+               * n es pequeño (<=40), así que sobra. */
+              for (int i = 0; i < n - 1; i++)
+                  for (int j = 0; j < n - 1 - i; j++)
+                      if (out[j].rssi < out[j + 1].rssi) {
+                          BleRadarDev t = out[j]; out[j] = out[j + 1]; out[j + 1] = t;
+                      }
+              return n;
+          }
+
+          const char* BleRadarMonitor::vendorName(uint16_t id) {
+              switch (id) {
+                  case 0x004C: return "Apple";
+                  case 0x0075: return "Samsung";
+                  case 0x00E0: return "Google";
+                  case 0x0006: return "Microsoft";
+                  case 0x0059: return "Nordic";
+                  case 0x0157: return "Huawei";
+                  case 0x038F: return "Xiaomi";
+                  case 0x0499: return "Ruuvi";
+                  case 0x0001: return "Ericsson";
+                  case 0x00D2: return "Fitbit";
+                  case 0x0087: return "Garmin";
+                  default:     return "";      /* desconocido → la UI muestra la MAC */
+              }
+          }
+
+          const char* BleRadarMonitor::distanceLabel(int16_t rssi) {
+              if (rssi >= BleRadarCfg::RSSI_NEAR) return "< 2 m";
+              if (rssi >= BleRadarCfg::RSSI_MID)  return "2-4 m";
+              if (rssi >= BleRadarCfg::RSSI_FAR)  return "5-10 m";
+              return "> 10 m";
+          }
+          ZZ_MEOW_EOF
+          cat > src/app/app_10/app_10.h << 'ZZ_MEOW_EOF'
+          /**
+           * @file  app_10.h
+           * @brief App10 — BLE Radar. Fase 1: escanea Bluetooth LE, identifica
+           *        fabricante y muestra los aparatos ordenados por cercanía (señal).
+           *
+           * Sustituye la app_10 vacía de fábrica. Se registra igual que las demás
+           * (la línea installApp(App10) del launcher ya existe), no hace falta tocar
+           * el launcher.
+           */
+          #pragma once
+          #include <mooncake.h>
+          #include <LovyanGFX.hpp>
+          #include "../../bsp/devices.h"
+          #include "ble_radar.h"
+
+          using namespace mooncake;
+
+          namespace MOONCAKE::APPS
+          {
+              class App10 : public AppAbility {
+              public:
+                  App10(DEVICES* device);
+                  void onOpen() override;
+                  void onRunning() override;
+                  void onClose() override;
+
+                  /* Vistas de la app. Lista/Radar se alternan con izquierda/derecha;
+                   * al pulsar A sobre un aparato se entra en Buscador (brújula). */
+                  enum class View : uint8_t { List, Radar, Finder };
+
+              private:
+                  DEVICES*         _device = nullptr;
+                  BleRadarMonitor  _mon;
+
+                  lgfx::LGFX_Sprite* _canvas = nullptr;
+                  bool _haveCanvas = false;
+
+                  BleRadarDev _list[BR_MAX_DEV];
+                  int  _n        = 0;   /* nº de aparatos en la última instantánea */
+                  int  _sel      = 0;   /* aparato seleccionado (fila / blip) */
+                  int  _scroll   = 0;   /* primera fila visible (vista lista) */
+                  uint8_t _selMac[6] = {0};   /* identidad del seleccionado (se pega a él) */
+                  bool _haveSelMac   = false;
+                  View _view     = View::Radar;   /* arranca en el radar */
+                  uint32_t _lastDraw = 0;
+
+                  /* ── Estado del Buscador (Fase 3) ── */
+                  uint8_t  _tgtMac[6] = {0};   /* aparato que perseguimos (por MAC fija) */
+                  bool     _spinning  = false; /* capturando rumbo mientras giras */
+                  uint32_t _spinStart = 0;
+                  int16_t  _bestRssi  = -127;  /* mejor señal vista durante el giro */
+                  float    _bearing   = 0;     /* rumbo fijado hacia el aparato (grados) */
+                  bool     _haveBearing = false;
+                  float    _hd        = -1;    /* rumbo actual de la brújula (cache por vuelta) */
+                  /* Auto-calibración de brújula (hierro-duro): min/max por eje */
+                  float _mnx=0,_mxx=0,_mny=0,_mxy=0; bool _magInit=false;
+
+                  float _heading();                 /* rumbo actual de la brújula (0..360) */
+                  int   _findTarget();              /* índice del aparato objetivo, -1 si no está */
+                  void  _enterFinder(int idx);
+
+                  template<typename LCD> void _renderList(LCD& lcd);
+                  template<typename LCD> void _renderRadar(LCD& lcd);
+                  template<typename LCD> void _renderFinder(LCD& lcd);
+                  void _present();
+              };
+          }
+          ZZ_MEOW_EOF
+          cat > src/app/app_10/app_10.cpp << 'ZZ_MEOW_EOF'
+          /**
+           * @file  app_10.cpp
+           * @brief BLE Radar — Fase 1 (lista de aparatos por cercanía). Ver app_10.h.
+           */
+          #include "app_10.h"
+          #include <Arduino.h>
+          #include <math.h>
+          #include "radar_ui.h"
+
+          namespace MOONCAKE::APPS
+          {
+
+          /* ── Lógica de interfaz centralizada, en un ÚNICO sitio ──────────────
+           * Toda geometría, paleta y cálculo compartido entre vistas vive aquí.
+           * Antes la geometría de la lista se calculaba por duplicado (al dibujar
+           * y al navegar); ahora ambas leen de la misma función.                 */
+          namespace RadarUI {
+              constexpr uint32_t DRAW_INTERVAL_MS = 200;   /* refresco de pantalla */
+              constexpr uint32_t FLASH_MS         = 450;   /* "recién emitido" → destello */
+              constexpr int      INFO_H           = 30;    /* alto de la ficha inferior */
+              constexpr int      RSSI_FLOOR       = -95;   /* señal más floja mapeable (radar) */
+              constexpr int      HOT_LO           = -95;   /* barra caliente/frío: 0%  */
+              constexpr int      HOT_HI           = -40;   /* barra caliente/frío: 100% */
+
+              /* --- Vista lista --- */
+              struct Geom { int y0; int rowH; int vis; };
+              static inline Geom list() {
+                  const int y0   = RUI::HDR_H + 22;
+                  const int rowH = 26;
+                  return { y0, rowH, (RUI::H - y0) / rowH };
+              }
+
+              /* --- Vista radar: centro y radios, derivados de la pantalla --- */
+              struct Radar { int cx; int cy; int rMax; int rMin; };
+              static inline Radar radar() {
+                  const int top    = RUI::HDR_H;
+                  const int bottom = RUI::H - INFO_H;
+                  const int cx     = RUI::W / 2;
+                  const int cy     = (top + bottom) / 2;
+                  int rMax = (bottom - top) / 2 - 6;
+                  return { cx, cy, rMax, 12 };
+              }
+
+              /* Ángulo DECORATIVO pero ESTABLE por aparato: se deriva de su MAC,
+               * así cada uno se queda siempre en el mismo sitio del radar.
+               * (El ángulo real llegará con la brújula en la Fase 3.) */
+              static inline int angleFor(const uint8_t* mac) {
+                  uint32_t h = 2166136261u;                 /* hash FNV-1a corto */
+                  for (int i = 0; i < 6; i++) { h ^= mac[i]; h *= 16777619u; }
+                  return (int)(h % 360);
+              }
+
+              /* Señal → radio: cerca (RSSI alto) al centro, lejos al borde.
+               * Usa los umbrales de la config central de ble_radar.h.            */
+              static inline int radiusFor(int rssi, const Radar& g) {
+                  int hi = BleRadarCfg::RSSI_NEAR;          /* -55 → centro */
+                  int lo = RSSI_FLOOR;                      /* -95 → borde  */
+                  if (rssi > hi) rssi = hi;
+                  if (rssi < lo) rssi = lo;
+                  float t = (float)(hi - rssi) / (float)(hi - lo);   /* 0..1 */
+                  return g.rMin + (int)(t * (g.rMax - g.rMin));
+              }
+
+              /* Tipo/fabricante → color del blip. Fuente única de la paleta. */
+              static inline uint32_t typeColor(uint16_t vendorId) {
+                  switch (vendorId) {
+                      case 0x004C: return 0x38B6FF;   /* Apple    — azul  */
+                      case 0x0075: return 0x4EE66A;   /* Samsung  — verde */
+                      case 0x00E0: return 0xFFB648;   /* Google   — ámbar */
+                      case 0x0006: return 0x00E5D0;   /* Microsoft— cian  */
+                      case 0x038F: return 0xC66BFF;   /* Xiaomi   — morado*/
+                      default:     return 0xBBE700;   /* otros    — verde MeowKit */
+                  }
+              }
+          }
+
+          App10::App10(DEVICES* device) : _device(device)
+          {
+              setAppInfo().name = "BLE Radar";
+          }
+
+          /* Formatea los últimos 3 bytes de la MAC, p.ej. "··:1E:C4" */
+          static void macTail(const uint8_t* mac, char* out, size_t n) {
+              snprintf(out, n, "%02X:%02X:%02X", mac[3], mac[4], mac[5]);
+          }
+
+          template<typename LCD>
+          void App10::_renderList(LCD& lcd)
+          {
+              RUI::clearScreen(lcd);
+              RUI::drawHeader(lcd, "BLE Radar");
+
+              /* Línea de estado: nº de aparatos + LIVE/PAUSED */
+              char hdr[40];
+              snprintf(hdr, sizeof(hdr), "%d aparatos", _n);
+              lcd.setFont(&fonts::efontCN_16);
+              lcd.setTextSize(1);
+              lcd.setTextColor(RUI::TEXT_SEC, RUI::BLACK);
+              lcd.setCursor(RUI::PAD, RUI::HDR_H + 4);
+              lcd.printf("%s", hdr);
+              lcd.setTextColor(_mon.running() ? RUI::OK : RUI::WARN, RUI::BLACK);
+              lcd.setCursor(RUI::W - 70, RUI::HDR_H + 4);
+              lcd.printf("%s", _mon.running() ? "LIVE" : "PAUSA");
+
+              /* Lista (geometría desde la fuente única) */
+              const RadarUI::Geom g = RadarUI::list();
+              const int y0 = g.y0, rowH = g.rowH, vis = g.vis;
+
+              if (_n == 0) {
+                  lcd.setTextColor(RUI::TEXT_SEC, RUI::BLACK);
+                  lcd.setCursor(RUI::PAD, y0 + 20);
+                  lcd.printf("Escuchando... acerca un movil");
+                  return;
+              }
+
+              for (int r = 0; r < vis; r++) {
+                  int i = _scroll + r;
+                  if (i >= _n) break;
+                  const BleRadarDev& d = _list[i];
+                  int y = y0 + r * rowH;
+                  bool selected = (i == _sel);
+
+                  uint32_t bg = selected ? RUI::SEL_BG : (r & 1 ? RUI::ITEM_BG_ALT : RUI::ITEM_BG);
+                  uint32_t fg = selected ? RUI::SEL_TEXT : RUI::TEXT_PRI;
+                  uint32_t fg2 = selected ? RUI::SEL_TEXT : RUI::TEXT_SEC;
+                  lcd.fillRect(6, y, RUI::W - 12, rowH - 2, bg);
+
+                  /* Nombre (o marca, o cola de la MAC) */
+                  const char* vend = BleRadarMonitor::vendorName(d.vendorId);
+                  char line1[28];
+                  if (d.name[0])       snprintf(line1, sizeof(line1), "%s", d.name);
+                  else if (vend[0])    snprintf(line1, sizeof(line1), "%s", vend);
+                  else                 macTail(d.mac, line1, sizeof(line1));
+                  lcd.setTextColor(fg, bg);
+                  lcd.setCursor(12, y + 3);
+                  lcd.printf("%s", line1);
+
+                  /* Segunda línea: distancia + señal */
+                  char line2[36];
+                  snprintf(line2, sizeof(line2), "%s  %ddBm  %s",
+                           BleRadarMonitor::distanceLabel(d.rssi),
+                           (int)d.rssi,
+                           (d.name[0] && vend[0]) ? vend : "");
+                  lcd.setTextColor(fg2, bg);
+                  lcd.setCursor(12, y + 14);
+                  lcd.printf("%s", line2);
+              }
+
+              /* Barra de scroll si hay más de lo que cabe */
+              if (_n > vis) {
+                  int trackH = RUI::H - y0;
+                  int barH = trackH * vis / _n; if (barH < 8) barH = 8;
+                  int barY = y0 + (trackH - barH) * _scroll / (_n - vis);
+                  lcd.fillRect(RUI::W - 4, barY, 3, barH, RUI::ACCENT);
+              }
+          }
+
+          template<typename LCD>
+          void App10::_renderRadar(LCD& lcd)
+          {
+              RUI::clearScreen(lcd);
+              RUI::drawHeader(lcd, "BLE Radar");
+
+              const RadarUI::Radar g = RadarUI::radar();
+              const uint32_t now = millis();
+
+              /* Fondo circular oscuro tipo pantalla de radar */
+              lcd.fillCircle(g.cx, g.cy, g.rMax + 4, 0x02120D);
+
+              /* Anillos + cruz */
+              const uint32_t GRID = 0x0C3A2C;
+              for (int k = 1; k <= 3; k++)
+                  lcd.drawCircle(g.cx, g.cy, g.rMax * k / 3, GRID);
+              lcd.drawLine(g.cx - g.rMax, g.cy, g.cx + g.rMax, g.cy, GRID);
+              lcd.drawLine(g.cx, g.cy - g.rMax, g.cx, g.cy + g.rMax, GRID);
+
+              /* Etiquetas de señal en los anillos (dBm) */
+              lcd.setFont(&fonts::efontCN_16);
+              lcd.setTextSize(1);
+              lcd.setTextColor(0x2F7D63, 0x02120D);
+              lcd.setCursor(g.cx + 3, g.cy - g.rMax * 1 / 3 - 6); lcd.printf("-65");
+              lcd.setCursor(g.cx + 3, g.cy - g.rMax * 3 / 3 + 2); lcd.printf("-95");
+
+              /* Barrido giratorio (da sensación de "vivo") */
+              {
+                  float a = ((now / 8) % 360) * 0.01745329f;
+                  int sx = g.cx + (int)(g.rMax * sinf(a));
+                  int sy = g.cy - (int)(g.rMax * cosf(a));
+                  lcd.drawLine(g.cx, g.cy, sx, sy, 0x1F5C46);
+              }
+
+              /* Blips */
+              for (int i = 0; i < _n; i++) {
+                  const BleRadarDev& d = _list[i];
+                  float a = RadarUI::angleFor(d.mac) * 0.01745329f;
+                  int r   = RadarUI::radiusFor(d.rssi, g);
+                  int x   = g.cx + (int)(r * sinf(a));
+                  int y   = g.cy - (int)(r * cosf(a));
+                  uint32_t col = RadarUI::typeColor(d.vendorId);
+
+                  bool flash = (now - d.lastSeen) < RadarUI::FLASH_MS;   /* recién emitió */
+                  int rad = flash ? 4 : 3;
+                  lcd.fillCircle(x, y, rad, col);
+                  if (flash) lcd.drawCircle(x, y, rad + 2, col);         /* halo destello */
+
+                  if (i == _sel) {                                       /* seleccionado */
+                      lcd.drawRect(x - 6, y - 6, 13, 13, 0xFFFFFF);
+                      lcd.drawLine(g.cx, g.cy, x, y, col);
+                  }
+              }
+
+              /* Ficha inferior del aparato seleccionado */
+              const int iy = RUI::H - RadarUI::INFO_H;
+              lcd.fillRect(0, iy, RUI::W, RadarUI::INFO_H, 0x0E1418);
+              lcd.drawFastHLine(0, iy, RUI::W, 0x1E2C28);
+              if (_n > 0 && _sel >= 0 && _sel < _n) {
+                  const BleRadarDev& d = _list[_sel];
+                  const char* vend = BleRadarMonitor::vendorName(d.vendorId);
+                  char l1[28];
+                  if (d.name[0])    snprintf(l1, sizeof(l1), "%s", d.name);
+                  else if (vend[0]) snprintf(l1, sizeof(l1), "%s", vend);
+                  else              snprintf(l1, sizeof(l1), "%02X:%02X:%02X",
+                                             d.mac[3], d.mac[4], d.mac[5]);
+                  lcd.fillCircle(12, iy + 15, 4, RadarUI::typeColor(d.vendorId));
+                  lcd.setTextColor(RUI::TEXT_PRI, 0x0E1418);
+                  lcd.setCursor(24, iy + 4);  lcd.printf("%s", l1);
+                  lcd.setTextColor(RUI::TEXT_SEC, 0x0E1418);
+                  lcd.setCursor(24, iy + 16);
+                  lcd.printf("%s  %ddBm", BleRadarMonitor::distanceLabel(d.rssi), (int)d.rssi);
+              } else {
+                  lcd.setTextColor(RUI::TEXT_SEC, 0x0E1418);
+                  lcd.setCursor(24, iy + 10); lcd.printf("Escuchando... acerca un movil");
+              }
+
+              /* Estado arriba a la derecha */
+              lcd.setTextColor(_mon.running() ? RUI::OK : RUI::WARN, RUI::BLACK);
+              lcd.setCursor(RUI::W - 70, RUI::HDR_H + 4);
+              lcd.printf("%d %s", _n, _mon.running() ? "LIVE" : "PAUSA");
+          }
+
+          /* ── Buscador (Fase 3): brújula + giro cuerpo-antena ─────────────────── */
+
+          /* Rumbo actual de la brújula (0..360), o -1 si no hay magnetómetro.
+           * Auto-calibra el "hierro duro" con los min/max vistos (mejora al girar). */
+          float App10::_heading()
+          {
+              _device->imu.update();
+              float mx, my, mz;
+              if (!_device->imu.getMag(&mx, &my, &mz)) return -1.0f;
+              if (!_magInit) { _mnx = _mxx = mx; _mny = _mxy = my; _magInit = true; }
+              if (mx < _mnx) _mnx = mx;
+              if (mx > _mxx) _mxx = mx;
+              if (my < _mny) _mny = my;
+              if (my > _mxy) _mxy = my;
+              float cx = (_mnx + _mxx) * 0.5f, cy = (_mny + _mxy) * 0.5f;
+              float deg = atan2f(my - cy, mx - cx) * 57.29578f;
+              if (deg < 0) deg += 360.0f;
+              return deg;
+          }
+
+          int App10::_findTarget()
+          {
+              for (int i = 0; i < _n; i++)
+                  if (memcmp(_list[i].mac, _tgtMac, 6) == 0) return i;
+              return -1;
+          }
+
+          void App10::_enterFinder(int idx)
+          {
+              if (idx < 0 || idx >= _n) return;
+              memcpy(_tgtMac, _list[idx].mac, 6);
+              _view = View::Finder;
+              _spinning = false; _haveBearing = false; _bestRssi = -127;
+          }
+
+          template<typename LCD>
+          void App10::_renderFinder(LCD& lcd)
+          {
+              RUI::clearScreen(lcd);
+              RUI::drawHeader(lcd, "Buscador");
+
+              int ti = _findTarget();
+              const int cx = RUI::W / 2;
+              const int cy = RUI::HDR_H + 78;
+              const int R  = 62;
+
+              /* Nombre del objetivo */
+              char who[28];
+              if (ti >= 0 && _list[ti].name[0]) snprintf(who, sizeof(who), "%s", _list[ti].name);
+              else {
+                  const char* v = (ti >= 0) ? BleRadarMonitor::vendorName(_list[ti].vendorId) : "";
+                  if (v[0]) snprintf(who, sizeof(who), "%s", v);
+                  else snprintf(who, sizeof(who), "%02X:%02X:%02X", _tgtMac[3], _tgtMac[4], _tgtMac[5]);
+              }
+              lcd.setFont(&fonts::efontCN_16); lcd.setTextSize(1);
+              lcd.setTextColor(RUI::ACCENT, RUI::BLACK);
+              lcd.setCursor(RUI::PAD, RUI::HDR_H + 4);
+              lcd.printf("-> %s", who);
+
+              /* Esfera de la brújula */
+              lcd.drawCircle(cx, cy, R, RUI::BORDER);
+              lcd.drawCircle(cx, cy, R - 1, 0x1E2C28);
+
+              bool haveMag = (_hd >= 0);
+
+              if (_spinning) {
+                  /* Progreso del giro + mejor señal encontrada */
+                  uint32_t el = millis() - _spinStart;
+                  int pct = (int)(el * 100 / BleRadarCfg::SPIN_MS); if (pct > 100) pct = 100;
+                  lcd.setTextColor(RUI::WHITE, 0x1E2C28);
+                  lcd.setTextSize(2);
+                  lcd.setCursor(cx - 34, cy - 8); lcd.printf("%d%%", pct);
+                  lcd.setTextSize(1);
+                  lcd.setTextColor(RUI::TEXT_SEC, RUI::BLACK);
+                  lcd.setCursor(cx - 58, cy + R + 6); lcd.printf("Gira despacio una vuelta...");
+              } else if (_haveBearing && haveMag) {
+                  /* Flecha hacia el aparato, relativa a hacia dónde miras ahora */
+                  float rel = _bearing - _hd; while (rel < 0) rel += 360; while (rel >= 360) rel -= 360;
+                  float a = rel * 0.01745329f;
+                  int ax = cx + (int)((R - 10) * sinf(a));
+                  int ay = cy - (int)((R - 10) * cosf(a));
+                  /* línea + punta */
+                  lcd.drawLine(cx, cy, ax, ay, RUI::ACCENT);
+                  lcd.fillCircle(ax, ay, 5, RUI::ACCENT);
+                  lcd.fillCircle(cx, cy, 3, RUI::WHITE);
+                  lcd.setTextColor(RUI::TEXT_SEC, RUI::BLACK);
+                  lcd.setCursor(cx - 40, cy + R + 6); lcd.printf("Camina hacia la flecha");
+              } else {
+                  lcd.setTextColor(haveMag ? RUI::TEXT_SEC : RUI::WARN, 0x1E2C28);
+                  lcd.setCursor(cx - 46, cy - 4);
+                  lcd.printf(haveMag ? "Pulsa A y gira" : "Sin brujula");
+              }
+
+              /* Barra caliente/frío con la señal actual del objetivo */
+              const int by = RUI::H - 26, bx = 14, bw = RUI::W - 28, bh = 12;
+              lcd.drawRect(bx, by, bw, bh, RUI::BORDER);
+              if (ti >= 0) {
+                  int rssi = _list[ti].rssi;
+                  int lo = RadarUI::HOT_LO, hi = RadarUI::HOT_HI;
+                  int t = (rssi - lo) * 100 / (hi - lo);
+                  if (t < 0) t = 0;
+                  if (t > 100) t = 100;
+                  uint32_t c = (t > 66) ? RUI::OK : (t > 33 ? RUI::WARN : RUI::ERR);
+                  lcd.fillRect(bx + 1, by + 1, (bw - 2) * t / 100, bh - 2, c);
+                  lcd.setTextColor(RUI::TEXT_PRI, RUI::BLACK);
+                  lcd.setCursor(bx, by - 12);
+                  lcd.printf("%s  %ddBm", BleRadarMonitor::distanceLabel(rssi), rssi);
+              } else {
+                  lcd.setTextColor(RUI::ERR, RUI::BLACK);
+                  lcd.setCursor(bx, by - 12); lcd.printf("Senal perdida (fuera de alcance)");
+              }
+          }
+
+          void App10::_present()
+          {
+              if (_haveCanvas) {
+                  if      (_view == View::Radar)  _renderRadar(*_canvas);
+                  else if (_view == View::Finder) _renderFinder(*_canvas);
+                  else                            _renderList(*_canvas);
+                  _canvas->pushSprite(&_device->Lcd, 0, 0);
+              } else {
+                  if      (_view == View::Radar)  _renderRadar(_device->Lcd);
+                  else if (_view == View::Finder) _renderFinder(_device->Lcd);
+                  else                            _renderList(_device->Lcd);
+              }
+          }
+
+          void App10::onOpen()
+          {
+              _haveCanvas = false;
+              _canvas = new lgfx::LGFX_Sprite(&_device->Lcd);
+              if (_canvas) {
+                  _canvas->setColorDepth(16);
+                  _canvas->setPsram(true);
+                  _haveCanvas = _canvas->createSprite(RUI::W, RUI::H);
+              }
+              _sel = 0; _scroll = 0; _n = 0;
+              _haveSelMac = false;
+              _view = View::Radar;
+              _spinning = false; _haveBearing = false; _magInit = false;
+              _mon.begin();
+          }
+
+          void App10::onRunning()
+          {
+              _device->button.update();
+              _device->button.tick();
+
+              _mon.loop();
+              _n  = _mon.snapshot(_list);
+              _hd = _heading();                 /* rumbo actual (o -1 si no hay brújula) */
+
+              if (_view == View::Finder) {
+                  /* A: iniciar/reiniciar la captura de rumbo (la vuelta). */
+                  if (_device->button.A.pressed()) {
+                      _spinning = true; _spinStart = millis();
+                      _bestRssi = -127; _haveBearing = false;
+                  }
+                  /* Izquierda/derecha: salir del buscador al radar. */
+                  if (_device->button.Left.pressed() || _device->button.Right.pressed()) {
+                      _spinning = false; _view = View::Radar;
+                  }
+                  /* Durante el giro: el rumbo donde la señal es más fuerte apunta al
+                   * aparato (tu cuerpo tapa la señal cuando queda a la espalda). */
+                  if (_spinning) {
+                      int ti = _findTarget();
+                      if (ti >= 0 && _hd >= 0 && _list[ti].rssi > _bestRssi) {
+                          _bestRssi   = _list[ti].rssi;
+                          _bearing    = _hd;
+                          _haveBearing = true;
+                      }
+                      if (millis() - _spinStart >= BleRadarCfg::SPIN_MS) _spinning = false;
+                  }
+              } else {
+                  /* Vistas lista / radar */
+                  if (_device->button.Left.pressed() || _device->button.Right.pressed())
+                      _view = (_view == View::Radar) ? View::List : View::Radar;
+
+                  /* La lista se reordena por señal; re-anclamos la selección al MISMO
+                   * aparato (por MAC) antes de mover, para que no "salte" solo. */
+                  if (_haveSelMac) {
+                      for (int i = 0; i < _n; i++)
+                          if (memcmp(_list[i].mac, _selMac, 6) == 0) { _sel = i; break; }
+                  }
+
+                  if (_device->button.Down.pressed()) _sel++;
+                  if (_device->button.Up.pressed())   _sel--;
+
+                  if (_sel < 0) _sel = 0;
+                  if (_sel > _n - 1) _sel = _n - 1;
+                  if (_sel < 0) _sel = 0;
+
+                  /* Guardamos qué aparato queda seleccionado, por identidad. */
+                  if (_n > 0 && _sel >= 0 && _sel < _n) {
+                      memcpy(_selMac, _list[_sel].mac, 6);
+                      _haveSelMac = true;
+                  }
+
+                  if (_device->button.A.pressed()) _enterFinder(_sel);   /* → buscar */
+
+                  const RadarUI::Geom g = RadarUI::list();
+                  if (_sel < _scroll)          _scroll = _sel;
+                  if (_sel >= _scroll + g.vis) _scroll = _sel - g.vis + 1;
+                  if (_scroll < 0)             _scroll = 0;
+              }
+
+              const uint32_t now = millis();
+              if (now - _lastDraw >= RadarUI::DRAW_INTERVAL_MS) { _present(); _lastDraw = now; }
+
+              delay(20);
+          }
+
+          void App10::onClose()
+          {
+              _mon.pause();
+              if (_canvas) { _canvas->deleteSprite(); delete _canvas; _canvas = nullptr; }
+          }
+
+          } // namespace MOONCAKE::APPS
+          ZZ_MEOW_EOF
+          cat > src/app/app_10/radar_ui.h << 'ZZ_MEOW_EOF'
+          /**
+           * @file  radar_ui.h
+           * @brief Helpers de interfaz AUTOCONTENIDOS para la app BLE Radar.
+           *
+           * La app no depende de los helpers de ningún firmware concreto (ni del
+           * oficial ni de MeowGotchi): trae aquí sus propias medidas, paleta y
+           * la cabecera. Así compila "arrastrando" los archivos a cualquier base.
+           *
+           * Dibuja con LovyanGFX sobre el Lcd del MeowKit (pantalla 320x240).
+           */
+          #pragma once
+          #include <cstdint>
+          #include <LovyanGFX.hpp>
+
+          namespace RUI {
+
+          /* ── Medidas de pantalla ── */
+          constexpr int W      = 320;   /* ancho del panel  */
+          constexpr int H      = 240;   /* alto del panel   */
+          constexpr int HDR_H  = 22;    /* alto de la barra de cabecera */
+          constexpr int PAD    = 8;     /* margen lateral   */
+
+          /* ── Paleta (RGB888; LovyanGFX la convierte al panel) ── */
+          constexpr uint32_t BLACK       = 0x000000;
+          constexpr uint32_t WHITE       = 0xFFFFFF;
+          constexpr uint32_t ACCENT      = 0xBBE700;   /* verde-lima MeowKit */
+          constexpr uint32_t TEXT_PRI    = 0xFFFFFF;
+          constexpr uint32_t TEXT_SEC    = 0x8A8A8A;
+          constexpr uint32_t ITEM_BG     = 0x1A1A1A;
+          constexpr uint32_t ITEM_BG_ALT = 0x222222;
+          constexpr uint32_t SEL_BG      = 0xBBE700;
+          constexpr uint32_t SEL_TEXT    = 0x000000;
+          constexpr uint32_t BORDER      = 0x333333;
+          constexpr uint32_t OK          = 0x00DD44;
+          constexpr uint32_t WARN        = 0xFFAA00;
+          constexpr uint32_t ERR         = 0xFF3B30;
+
+          /* ── Cabecera y limpieza (plantillas: sirven para Lcd o Sprite) ── */
+          template<typename LCD>
+          static inline void clearScreen(LCD& lcd) {
+              lcd.fillScreen(BLACK);
+          }
+
+          template<typename LCD>
+          static inline void drawHeader(LCD& lcd, const char* title) {
+              lcd.fillRect(0, 0, W, HDR_H, 0x111111);
+              lcd.drawFastHLine(0, HDR_H, W, ACCENT);
+              lcd.setFont(&fonts::efontCN_16);
+              lcd.setTextSize(1);
+              lcd.setTextColor(ACCENT, 0x111111);
+              lcd.setCursor(PAD, 4);
+              lcd.printf("%s", title);
+          }
+
+          } // namespace RUI
+          ZZ_MEOW_EOF
+          echo "Archivos escritos:"; ls -la src/app/app_10
+
+      - name: Arreglo de arranque (modo de flash DIO)
+        run: |
+          sed -i 's/board_build.flash_mode *= *qio/board_build.flash_mode = dio/' platformio.ini || true
+          grep -n 'flash_mode' platformio.ini || true
+
+      - name: Compilar
+        run: pio run
+
+      - name: Unir en una sola imagen flasheable (offset 0x0)
+        run: |
+          set -e
+          D=.pio/build/esp32s3box
+          BOOTAPP="$(find ~/.platformio -name boot_app0.bin | head -1)"
+          echo "boot_app0: $BOOTAPP"
+          python -m esptool --chip esp32s3 merge_bin \
+            -o firmware-merged-0x0.bin \
+            --flash_mode dio --flash_freq 80m --flash_size 16MB \
+            0x0     "$D/bootloader.bin" \
+            0x8000  "$D/partitions.bin" \
+            0xe000  "$BOOTAPP" \
+            0x10000 "$D/firmware.bin"
+          ls -la firmware-merged-0x0.bin
+
+      - name: Subir el firmware como artefacto descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: meowkit-firmware
+          path: |
+            firmware-merged-0x0.bin
+            .pio/build/esp32s3box/firmware.bin
+            .pio/build/esp32s3box/bootloader.bin
+            .pio/build/esp32s3box/partitions.bin
+          if-no-files-found: error
